@@ -9,6 +9,7 @@ import Editor from 'react-simple-code-editor';
 import Prism from 'prismjs';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
+import { Octokit } from '@octokit/rest';
 import 'prismjs/components/prism-javascript';
 import 'prismjs/components/prism-css';
 import 'prismjs/components/prism-markup';
@@ -20,7 +21,7 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY });
 
 const SYSTEM_INSTRUCTION = `You are an elite 10x AI Developer, my brother in code. You are a powerhouse IDE.
 You have FULL access to a real file system in the '/workspace' directory.
@@ -96,10 +97,9 @@ type Message = {
   type?: 'text' | 'tool';
 };
 
-type FileNode = {
-  name: string;
+type VirtualFile = {
   path: string;
-  isDirectory?: boolean;
+  content: string;
 };
 
 export default function App() {
@@ -111,10 +111,9 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [activeTab, setActiveTab] = useState<'preview' | 'code'>('preview');
   
-  const [files, setFiles] = useState<FileNode[]>([]);
+  const [vfs, setVfs] = useState<VirtualFile[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileContent, setFileContent] = useState<string>('');
-  const [previewKey, setPreviewKey] = useState(0);
   const [githubToken, setGithubToken] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -128,8 +127,10 @@ export default function App() {
     
     const savedMessages = localStorage.getItem('chat_messages');
     const savedHistory = localStorage.getItem('chat_history');
+    const savedVfs = localStorage.getItem('vfs_files');
     if (savedMessages) setMessages(JSON.parse(savedMessages));
     if (savedHistory) setRawHistory(JSON.parse(savedHistory));
+    if (savedVfs) setVfs(JSON.parse(savedVfs));
   }, []);
 
   useEffect(() => {
@@ -138,6 +139,10 @@ export default function App() {
       localStorage.setItem('chat_history', JSON.stringify(rawHistory));
     }
   }, [messages, rawHistory]);
+
+  useEffect(() => {
+    localStorage.setItem('vfs_files', JSON.stringify(vfs));
+  }, [vfs]);
 
   const saveSettings = () => {
     localStorage.setItem('github_token', githubToken);
@@ -152,85 +157,35 @@ export default function App() {
     scrollToBottom();
   }, [messages]);
 
-  const fetchFiles = async () => {
-    try {
-      const res = await fetch('/api/fs/list');
-      const data = await res.json();
-      if (data.files) {
-        setFiles(data.files);
-      }
-    } catch (e) {
-      console.error("Failed to fetch files", e);
-    }
-  };
-
-  useEffect(() => {
-    fetchFiles();
-  }, []);
-
-  const handleFileSelect = async (path: string) => {
+  const handleFileSelect = (path: string) => {
     setSelectedFile(path);
     setActiveTab('code');
-    try {
-      const res = await fetch(`/api/fs/read?path=${encodeURIComponent(path)}`);
-      const data = await res.json();
-      setFileContent(data.content || '');
-    } catch (e) {
-      console.error("Failed to read file", e);
-    }
+    const file = vfs.find(f => f.path === path);
+    setFileContent(file ? file.content : '');
   };
 
-  const handleSaveFile = async (contentToSave: string = fileContent) => {
+  const handleSaveFile = (contentToSave: string = fileContent) => {
     if (!selectedFile) return;
     setIsSaving(true);
-    try {
-      await fetch('/api/fs/write', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: selectedFile, content: contentToSave })
-      });
-      setPreviewKey(k => k + 1);
-    } catch (e) {
-      console.error("Failed to save file", e);
-    } finally {
-      setIsSaving(false);
-    }
+    setVfs(prev => prev.map(f => f.path === selectedFile ? { ...f, content: contentToSave } : f));
+    setTimeout(() => setIsSaving(false), 500);
   };
 
-  const handleNewFile = async () => {
+  const handleNewFile = () => {
     const fileName = prompt("Enter new file name (e.g., script.js):");
-    if (fileName) {
-      try {
-        await fetch('/api/fs/write', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: fileName, content: '' })
-        });
-        fetchFiles();
-        handleFileSelect(fileName);
-      } catch (e) {
-        console.error("Failed to create file", e);
-      }
+    if (fileName && !vfs.find(f => f.path === fileName)) {
+      setVfs(prev => [...prev, { path: fileName, content: '' }]);
+      handleFileSelect(fileName);
     }
   };
 
-  const handleDeleteFile = async (e: React.MouseEvent, path: string) => {
+  const handleDeleteFile = (e: React.MouseEvent, path: string) => {
     e.stopPropagation();
     if (confirm(`Are you sure you want to delete ${path}?`)) {
-      try {
-        await fetch('/api/fs/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path })
-        });
-        if (selectedFile === path) {
-          setSelectedFile(null);
-          setFileContent('');
-        }
-        fetchFiles();
-        setPreviewKey(k => k + 1);
-      } catch (e) {
-        console.error("Failed to delete file", e);
+      setVfs(prev => prev.filter(f => f.path !== path));
+      if (selectedFile === path) {
+        setSelectedFile(null);
+        setFileContent('');
       }
     }
   };
@@ -238,12 +193,8 @@ export default function App() {
   const handleDownloadZip = async () => {
     try {
       const zip = new JSZip();
-      for (const file of files) {
-        if (!file.isDirectory) {
-          const res = await fetch(`/api/fs/read?path=${encodeURIComponent(file.path)}`);
-          const data = await res.json();
-          zip.file(file.path, data.content || '');
-        }
+      for (const file of vfs) {
+        zip.file(file.path, file.content);
       }
       const content = await zip.generateAsync({ type: 'blob' });
       saveAs(content, 'ai-builder-project.zip');
@@ -268,6 +219,27 @@ export default function App() {
     saveTimeoutRef.current = setTimeout(() => {
       handleSaveFile(code);
     }, 1000); // Auto-save after 1 second of typing
+  };
+
+  const generatePreviewHtml = () => {
+    const indexFile = vfs.find(f => f.path === 'index.html' || f.path === './index.html');
+    if (!indexFile) return '<div style="color:white;font-family:sans-serif;text-align:center;margin-top:20px;">No index.html found in workspace.</div>';
+
+    let html = indexFile.content;
+
+    const cssFiles = vfs.filter(f => f.path.endsWith('.css'));
+    for (const css of cssFiles) {
+      const regex = new RegExp(`<link[^>]*href=["']\\.?/?${css.path.replace('./', '')}["'][^>]*>`, 'gi');
+      html = html.replace(regex, `<style>\n${css.content}\n</style>`);
+    }
+
+    const jsFiles = vfs.filter(f => f.path.endsWith('.js'));
+    for (const js of jsFiles) {
+      const regex = new RegExp(`<script[^>]*src=["']\\.?/?${js.path.replace('./', '')}["'][^>]*><\\/script>`, 'gi');
+      html = html.replace(regex, `<script>\n${js.content}\n</script>`);
+    }
+
+    return html;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -305,39 +277,89 @@ export default function App() {
             let result;
             try {
               if (call.name === 'list_directory') {
-                const res = await fetch(`/api/fs/list?path=${encodeURIComponent(call.args.path as string)}`);
-                result = await res.json();
+                // Use functional state update to ensure we have the latest VFS
+                let currentVfs: VirtualFile[] = [];
+                setVfs(prev => { currentVfs = prev; return prev; });
+                result = { files: currentVfs.map(f => ({ name: f.path, path: f.path })) };
               } else if (call.name === 'read_file') {
-                const res = await fetch(`/api/fs/read?path=${encodeURIComponent(call.args.path as string)}`);
-                result = await res.json();
+                let currentVfs: VirtualFile[] = [];
+                setVfs(prev => { currentVfs = prev; return prev; });
+                const file = currentVfs.find(f => f.path === call.args.path);
+                result = file ? { content: file.content } : { error: "File not found" };
               } else if (call.name === 'write_file') {
-                const res = await fetch('/api/fs/write', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(call.args)
+                const path = call.args.path as string;
+                const content = call.args.content as string;
+                setVfs(prev => {
+                  const existing = prev.find(f => f.path === path);
+                  if (existing) {
+                    return prev.map(f => f.path === path ? { ...f, content } : f);
+                  }
+                  return [...prev, { path, content }];
                 });
-                result = await res.json();
-                fetchFiles();
-                setPreviewKey(k => k + 1);
+                result = { success: true };
               } else if (call.name === 'delete_file') {
-                const res = await fetch('/api/fs/delete', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(call.args)
-                });
-                result = await res.json();
-                fetchFiles();
-                setPreviewKey(k => k + 1);
+                const path = call.args.path as string;
+                setVfs(prev => prev.filter(f => f.path !== path));
+                if (selectedFile === path) {
+                  setSelectedFile(null);
+                  setFileContent('');
+                }
+                result = { success: true };
               } else if (call.name === 'github_sync') {
                 if (!githubToken) {
                   result = { error: "User has not configured a GitHub token. Ask them to click the Settings icon and add it." };
                 } else {
-                  const res = await fetch('/api/github/sync', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ...call.args, token: githubToken })
-                  });
-                  result = await res.json();
+                  let currentVfs: VirtualFile[] = [];
+                  setVfs(prev => { currentVfs = prev; return prev; });
+                  
+                  const octokit = new Octokit({ auth: githubToken });
+                  const { data: user } = await octokit.users.getAuthenticated();
+                  const owner = user.login;
+                  const repoName = call.args.repoName as string;
+                  const commitMessage = call.args.commitMessage as string || 'Update from AI Builder';
+
+                  let repo;
+                  try {
+                    const res = await octokit.repos.get({ owner, repo: repoName });
+                    repo = res.data;
+                  } catch (e: any) {
+                    if (e.status === 404) {
+                      const res = await octokit.repos.createForAuthenticatedUser({ name: repoName, auto_init: true });
+                      repo = res.data;
+                      await new Promise(r => setTimeout(r, 2000));
+                    } else throw e;
+                  }
+
+                  const tree = [];
+                  for (const file of currentVfs) {
+                    const { data: blob } = await octokit.git.createBlob({ owner, repo: repoName, content: file.content, encoding: 'utf-8' });
+                    tree.push({ path: file.path, mode: '100644', type: 'blob', sha: blob.sha });
+                  }
+
+                  let baseTreeSha, parentCommitSha, refName = 'heads/main';
+                  try {
+                    const { data: ref } = await octokit.git.getRef({ owner, repo: repoName, ref: 'heads/main' }).catch(() => octokit.git.getRef({ owner, repo: repoName, ref: 'heads/master' }));
+                    refName = ref.ref.replace('refs/', '');
+                    parentCommitSha = ref.object.sha;
+                    const { data: commit } = await octokit.git.getCommit({ owner, repo: repoName, commit_sha: parentCommitSha });
+                    baseTreeSha = commit.tree.sha;
+                  } catch (e) {}
+
+                  const treeParams: any = { owner, repo: repoName, tree };
+                  if (baseTreeSha) treeParams.base_tree = baseTreeSha;
+                  const { data: newTree } = await octokit.git.createTree(treeParams);
+
+                  const commitParams: any = { owner, repo: repoName, message: commitMessage, tree: newTree.sha };
+                  if (parentCommitSha) commitParams.parents = [parentCommitSha];
+                  const { data: newCommit } = await octokit.git.createCommit(commitParams);
+
+                  if (parentCommitSha) {
+                    await octokit.git.updateRef({ owner, repo: repoName, ref: refName, sha: newCommit.sha });
+                  } else {
+                    await octokit.git.createRef({ owner, repo: repoName, ref: 'refs/heads/main', sha: newCommit.sha });
+                  }
+
+                  result = { success: true, url: repo.html_url };
                 }
               }
             } catch (e: any) {
@@ -470,37 +492,34 @@ export default function App() {
             <button onClick={handleDownloadZip} title="Download Project as ZIP" className="p-1 hover:bg-gray-800 rounded text-gray-400 hover:text-gray-200">
               <Download className="w-4 h-4" />
             </button>
-            <button onClick={fetchFiles} title="Refresh" className="p-1 hover:bg-gray-800 rounded text-gray-400 hover:text-gray-200">
-              <RefreshCw className="w-4 h-4" />
+            <button onClick={() => setVfs([])} title="Clear Workspace" className="p-1 hover:bg-gray-800 rounded text-gray-400 hover:text-red-400">
+              <Trash2 className="w-4 h-4" />
             </button>
           </div>
         </div>
         <div className="flex-1 overflow-y-auto p-2 custom-scrollbar">
-          {files.map((file, idx) => (
+          {vfs.map((file, idx) => (
             <div 
               key={idx} 
-              onClick={() => !file.isDirectory && handleFileSelect(file.path)}
+              onClick={() => handleFileSelect(file.path)}
               className={cn(
                 "flex items-center justify-between px-2 py-1.5 rounded cursor-pointer text-sm transition-colors group",
-                selectedFile === file.path ? "bg-blue-600/20 text-blue-400" : "text-gray-400 hover:bg-gray-800 hover:text-gray-200",
-                file.isDirectory && "opacity-70 cursor-default hover:bg-transparent hover:text-gray-400"
+                selectedFile === file.path ? "bg-blue-600/20 text-blue-400" : "text-gray-400 hover:bg-gray-800 hover:text-gray-200"
               )}
             >
               <div className="flex items-center gap-2 truncate">
-                {file.isDirectory ? <Folder className="w-4 h-4 shrink-0" /> : <FileIcon className="w-4 h-4 shrink-0" />}
+                <FileIcon className="w-4 h-4 shrink-0" />
                 <span className="truncate">{file.path}</span>
               </div>
-              {!file.isDirectory && (
-                <button 
-                  onClick={(e) => handleDeleteFile(e, file.path)}
-                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 text-gray-500 hover:text-red-400 rounded transition-all"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
-              )}
+              <button 
+                onClick={(e) => handleDeleteFile(e, file.path)}
+                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 text-gray-500 hover:text-red-400 rounded transition-all"
+              >
+                <Trash2 className="w-3 h-3" />
+              </button>
             </div>
           ))}
-          {files.length === 0 && (
+          {vfs.length === 0 && (
             <div className="text-xs text-gray-500 p-2 text-center mt-4">
               Workspace is empty. Ask the AI to create files!
             </div>
@@ -558,8 +577,7 @@ export default function App() {
         <div className="flex-1 relative overflow-hidden bg-white">
           {activeTab === 'preview' ? (
             <iframe
-              key={previewKey}
-              src="/preview/index.html"
+              srcDoc={generatePreviewHtml()}
               title="Preview"
               className="w-full h-full border-0 bg-white"
               sandbox="allow-scripts allow-forms allow-popups allow-modals allow-same-origin"
